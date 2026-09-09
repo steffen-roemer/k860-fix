@@ -39,7 +39,55 @@ try:
     import evdev
     from evdev import ecodes as e
 except ImportError:
-    sys.exit("k860-fix: python-evdev is not installed (pacman -S python-evdev)")
+    sys.exit("k860-fix: python-evdev is not installed\n         Arch: pacman -S python-evdev | Debian/Ubuntu: apt install python3-evdev\n         Fedora: dnf install python3-evdev | any: pip install evdev")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Settings
+# ─────────────────────────────────────────────────────────────────────────────
+# Everything below can be overridden from the environment, which systemd reads
+# out of /etc/default/k860-fix. That keeps the shipped defaults correct for a
+# stock system while letting one machine differ without editing this file.
+
+def _env_str(name, default):
+    return os.environ.get(name, "").strip() or default
+
+
+def _env_bool(name, default):
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"k860-fix: {name}={raw!r} is not a number; using {default}",
+              file=sys.stderr)
+        return default
+
+
+def _env_keys(name, default):
+    """Parse "LEFTCTRL,LEFTSHIFT" (or "KEY_LEFTCTRL ...") into a set of codes."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    out = set()
+    for token in raw.replace(",", " ").split():
+        token = token.upper()
+        if not token.startswith(("KEY_", "BTN_")):
+            token = "KEY_" + token
+        code = getattr(e, token, None)
+        if code is None:
+            print(f"k860-fix: {name}: unknown key {token!r}, ignored", file=sys.stderr)
+            continue
+        out.add(code)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -49,9 +97,10 @@ except ImportError:
 VENDOR = 0x046D
 PRODUCT = 0xB359
 
-# Set to the keyboard's Bluetooth MAC to pin this to one specific K860, e.g.
-# UNIQ = "d1:1b:2e:31:e2:4d". None matches any K860.
-UNIQ = None
+# Pin to one specific keyboard by its Bluetooth MAC, e.g.
+#   K860_UNIQ=aa:bb:cc:dd:ee:ff
+# Unset matches any K860, which is what you want unless you own two.
+UNIQ = _env_str("K860_UNIQ", None)
 
 # A device must clear ALL of these before it is even considered. Three
 # independent checks, so a single coincidence cannot pull in the wrong
@@ -60,14 +109,16 @@ UNIQ = None
 # neither carries "K860" in its name.
 NAME_MUST_CONTAIN = "K860"
 
-# Devices this daemon must never touch under any circumstances, whatever else
-# matches. Belt and braces: nothing here can pass the checks above anyway.
+# Devices this daemon must never touch, whatever else matches. Belt and braces:
+# nothing listed here can pass the vendor/product test above anyway. Add your
+# own built-in keyboard if you want the extra reassurance -- losing the ability
+# to type is the one failure mode worth being paranoid about.
 NEVER_TOUCH = {
-    (0x05AC, 0x027B),   # Apple Inc. Apple Internal Keyboard / Trackpad
+    (0x05AC, 0x027B),   # Apple internal keyboard / trackpad
     (0x05AC, 0x8102),   # Apple T2 controller nodes
-    (0x05AC, 0x8103),   # Apple Headset
-    (0x05AC, 0x8302),   # Apple Touch Bar Display
-    (0x046D, 0xC548),   # Logi Bolt receiver (LIFT mouse etc.)
+    (0x05AC, 0x8103),   # Apple headset
+    (0x05AC, 0x8302),   # Apple Touch Bar display
+    (0x046D, 0xC548),   # Logi Bolt receiver
 }
 
 # Identity of the virtual devices we publish. Deliberately NOT the Logitech
@@ -83,7 +134,7 @@ VIRT_PREFIX = "k860-fix"
 # fastest human digraph (~60 ms), so it cannot collapse two real keystrokes.
 # The only cost is that a *genuinely* pressed companion key (numpad, Page Up,
 # media, Compose) waits this long. Drop to 0.010 if that ever feels sluggish.
-WINDOW = 0.030
+WINDOW = _env_float("K860_WINDOW", 0.030)
 
 # How often to look for the keyboard when it is absent (Bluetooth reconnects).
 RESCAN_INTERVAL = 2.0
@@ -117,23 +168,24 @@ PAIRS = [
 # Ctrl+F is Find in essentially every browser and editor, so plain Ctrl would
 # swallow it. Left Ctrl + Left Shift keeps the chord on the three stacked keys
 # at the left edge, reachable with one hand.
-CAPS_ESCAPE = {e.KEY_LEFTCTRL, e.KEY_LEFTSHIFT}
+CAPS_ESCAPE = _env_keys("K860_CAPS_ESCAPE", {e.KEY_LEFTCTRL, e.KEY_LEFTSHIFT})
 
 # How to produce a real Caps Lock once the chord fires.
 #
-# Omarchy runs with `compose:caps`, so KEY_CAPSLOCK is the Compose key --
-# emitting it would silently arm Compose rather than toggle Caps Lock. But
-# `shift:both_capslock_cancel` gives each Shift a second level:
+# On a stock system KEY_CAPSLOCK is Caps Lock, and emitting it is correct --
+# that is the default.
+#
+# But if your XKB options remap the Caps Lock key (Omarchy, for instance, ships
+# `compose:caps`, making it the Compose key), emitting KEY_CAPSLOCK arms that
+# instead. Where `shift:both_capslock` or `shift:both_capslock_cancel` is also
+# set, each Shift gains a second level:
 #
 #     key <RTSH> {[ Shift_R, Caps_Lock ], type="ALPHABETIC" };
 #
 # ALPHABETIC picks level 2 whenever Shift is active, so tapping Right Shift
-# while a Shift is held resolves to Caps_Lock. That is exactly what the
-# two-Shift gesture does, synthesised.
-#
-# Set to False to emit a plain KEY_CAPSLOCK instead -- correct only if you drop
-# `compose:caps` from kb_options, which costs you the Compose key.
-CAPS_VIA_BOTH_SHIFT = True
+# while a Shift is held resolves to Caps_Lock regardless of what the Caps Lock
+# key itself was remapped to. Set K860_CAPS_VIA_BOTH_SHIFT=1 to use that route.
+CAPS_VIA_BOTH_SHIFT = _env_bool("K860_CAPS_VIA_BOTH_SHIFT", False)
 
 # Modifiers we track from the K860's own stream to evaluate CAPS_ESCAPE.
 TRACKED_MODS = {e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL, e.KEY_LEFTALT, e.KEY_RIGHTALT,

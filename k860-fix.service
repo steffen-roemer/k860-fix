@@ -11,6 +11,9 @@ Wants=bluetooth.service
 Type=simple
 # Harmless if the module is already loaded or built in; '-' keeps a failure
 # here from blocking the service.
+# Optional machine-local settings (K860_WINDOW, K860_CAPS_ESCAPE,
+# K860_CAPS_VIA_BOTH_SHIFT, K860_UNIQ). The '-' makes it optional.
+EnvironmentFile=-/etc/default/k860-fix
 ExecStartPre=-/usr/bin/modprobe uinput
 ExecStart=/usr/local/bin/k860-fix run
 Restart=always

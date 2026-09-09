@@ -57,11 +57,23 @@ s, f = run([(1, e.BTN_MIDDLE, 1, 0), (0, e.KEY_B, 1, .0005),
 check("physical B -> b only (cross-node)", names(s[0].out), [("KEY_B", 1), ("KEY_B", 0)])
 check("  middle click suppressed", names(s[1].out), [])
 
-s, f = run([(0, e.KEY_CAPSLOCK, 1, 0), (0, e.KEY_F, 1, .0005),
-            (0, e.KEY_CAPSLOCK, 0, .112), (0, e.KEY_F, 0, .0007)],
-           mods_before=(e.KEY_LEFTCTRL, e.KEY_LEFTSHIFT))
+CHORD = [(0, e.KEY_CAPSLOCK, 1, 0), (0, e.KEY_F, 1, .0005),
+         (0, e.KEY_CAPSLOCK, 0, .112), (0, e.KEY_F, 0, .0007)]
+MODS = (e.KEY_LEFTCTRL, e.KEY_LEFTSHIFT)
+
+# Default: emit KEY_CAPSLOCK, correct wherever the Caps Lock key is not remapped.
+m.CAPS_VIA_BOTH_SHIFT = False
+s, f = run(CHORD, mods_before=MODS)
+check("chord -> KEY_CAPSLOCK, no f", names(s[0].out),
+      [("KEY_LEFTCTRL", 1), ("KEY_LEFTSHIFT", 1), ("KEY_CAPSLOCK", 1), ("KEY_CAPSLOCK", 0)])
+
+# K860_CAPS_VIA_BOTH_SHIFT=1: synthesise the two-Shift gesture instead, for
+# systems where KEY_CAPSLOCK has been remapped (e.g. compose:caps).
+m.CAPS_VIA_BOTH_SHIFT = True
+s, f = run(CHORD, mods_before=MODS)
 check("chord -> RightShift tap, no f", names(s[0].out),
       [("KEY_LEFTCTRL", 1), ("KEY_LEFTSHIFT", 1), ("KEY_RIGHTSHIFT", 1), ("KEY_RIGHTSHIFT", 0)])
+m.CAPS_VIA_BOTH_SHIFT = False
 
 for label, code in [("numpad /", e.KEY_KPSLASH), ("Page Up", e.KEY_PAGEUP),
                     ("#/backslash", e.KEY_BACKSLASH), ("prev-track", e.KEY_PREVIOUSSONG),

@@ -1,0 +1,21 @@
+# Machine-local settings for k860-fix. Installed to /etc/default/k860-fix,
+# which the systemd unit reads. Delete any line to fall back to the default.
+
+# Omarchy maps the Caps Lock key to Compose (`compose:caps`), so emitting
+# KEY_CAPSLOCK would arm Compose rather than toggle Caps Lock. Synthesise the
+# two-Shift gesture instead, which `shift:both_capslock_cancel` resolves to
+# Caps_Lock. Leave this unset on a stock system.
+K860_CAPS_VIA_BOTH_SHIFT=1
+
+# Left Ctrl + Left Shift + the Caps/F key: the three stacked keys at the left
+# edge, reachable with one hand. Note this makes Ctrl+Shift+F unavailable.
+K860_CAPS_ESCAPE=LEFTCTRL,LEFTSHIFT
+
+# Pairing window. Measured gap between a key and its bogus twin is ~0.5 ms, so
+# the 30 ms default has plenty of margin; lower it if a genuinely pressed
+# numpad key feels sluggish.
+#K860_WINDOW=0.030
+
+# Pin to one specific keyboard by Bluetooth MAC. Unset matches any K860, which
+# is what you want unless you own two.
+#K860_UNIQ=d1:1b:2e:31:e2:4d
