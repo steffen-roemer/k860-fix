@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""
+k860-fix -- collapse the doubled HID events of a faulty Logitech ERGO K860.
+
+The keyboard has a hardware fault where certain physical keys emit two input
+events instead of one. This daemon grabs the K860's evdev nodes exclusively,
+drops the bogus companion event, and republishes a corrected stream on virtual
+uinput devices. Every other input device on the system is left untouched.
+
+Design notes
+------------
+* The intended key is NEVER delayed. Only the (rare) companion keys are held,
+  and only until their partner shows up or the pairing window expires. So `d`,
+  `f`, `t`, `b` etc. have zero added latency; a genuine numpad slash costs 30 ms.
+* Pairing spans devices: the B fault emits BTN_MIDDLE on the Mouse node and
+  KEY_B on the Keyboard node, so all nodes feed one ordered queue.
+* Timing uses CLOCK_MONOTONIC, taken when the event is read.
+* Events are queued in arrival order and flushed in order, so a held companion
+  briefly blocks the events behind it rather than letting them overtake it.
+
+Usage
+-----
+  k860-fix diag              watch events without grabbing (safe, diagnostic)
+  k860-fix run               grab and filter (this is what the service runs)
+  k860-fix run --no-grab     filter into virtual devices without grabbing,
+                             for testing the logic without taking over
+"""
+
+import argparse
+import errno
+import os
+import select
+import signal
+import sys
+import time
+from collections import deque
+
+try:
+    import evdev
+    from evdev import ecodes as e
+except ImportError:
+    sys.exit("k860-fix: python-evdev is not installed (pacman -S python-evdev)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Device identity
+# ─────────────────────────────────────────────────────────────────────────────
+# 1133/45913 from Karabiner == 0x046D/0xB359, and they survive Bluetooth intact.
+VENDOR = 0x046D
+PRODUCT = 0xB359
+
+# Set to the keyboard's Bluetooth MAC to pin this to one specific K860, e.g.
+# UNIQ = "d1:1b:2e:31:e2:4d". None matches any K860.
+UNIQ = None
+
+# A device must clear ALL of these before it is even considered. Three
+# independent checks, so a single coincidence cannot pull in the wrong
+# keyboard. The Apple internal keyboard is 0x05AC:0x027B and the Logi Bolt
+# receiver is 0x046D:0xC548; neither can satisfy the vendor/product test, and
+# neither carries "K860" in its name.
+NAME_MUST_CONTAIN = "K860"
+
+# Devices this daemon must never touch under any circumstances, whatever else
+# matches. Belt and braces: nothing here can pass the checks above anyway.
+NEVER_TOUCH = {
+    (0x05AC, 0x027B),   # Apple Inc. Apple Internal Keyboard / Trackpad
+    (0x05AC, 0x8102),   # Apple T2 controller nodes
+    (0x05AC, 0x8103),   # Apple Headset
+    (0x05AC, 0x8302),   # Apple Touch Bar Display
+    (0x046D, 0xC548),   # Logi Bolt receiver (LIFT mouse etc.)
+}
+
+# Identity of the virtual devices we publish. Deliberately NOT the Logitech
+# vendor id, so discovery can never match our own output and form a loop.
+VIRT_VENDOR = 0xFADE
+VIRT_PRODUCT = 0x0860
+VIRT_PREFIX = "k860-fix"
+
+# Pairing window. Measured on this keyboard under Linux, the twin lands
+# ~0.5 ms after its partner -- far tighter than the 10-18 ms Karabiner
+# reported on macOS. 30 ms is kept anyway: it is 60x the observed gap, so it
+# absorbs any Bluetooth retransmission jitter, and it is still far below the
+# fastest human digraph (~60 ms), so it cannot collapse two real keystrokes.
+# The only cost is that a *genuinely* pressed companion key (numpad, Page Up,
+# media, Compose) waits this long. Drop to 0.010 if that ever feels sluggish.
+WINDOW = 0.030
+
+# How often to look for the keyboard when it is absent (Bluetooth reconnects).
+RESCAN_INTERVAL = 2.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fault table
+# ─────────────────────────────────────────────────────────────────────────────
+# (intended, companion): pressing the physical key emits both; we keep the
+# intended one and drop the companion. A companion pressed on its own -- a real
+# numpad key, a real Page Up, the real media key -- still works: it is simply
+# held for WINDOW and then released unchanged.
+PAIRS = [
+    (e.KEY_D,      e.KEY_KPSLASH),      # physical D
+    (e.KEY_3,      e.KEY_KP8),          # physical 3
+    (e.KEY_8,      e.KEY_KPMINUS),      # physical 8
+    (e.KEY_Y,      e.KEY_BACKSLASH),    # physical Z on a German layout
+    (e.KEY_COMMA,  e.KEY_KP1),          # physical comma
+    (e.KEY_TAB,    e.KEY_PAGEUP),       # physical Tab
+    (e.KEY_T,      e.KEY_PREVIOUSSONG), # physical T
+    (e.KEY_DELETE, e.KEY_KPASTERISK),   # physical Entf / Delete Forward
+    (e.KEY_B,      e.BTN_MIDDLE),       # physical B  (companion is on the Mouse node)
+    (e.KEY_F,      e.KEY_CAPSLOCK),     # physical F  -- see CAPS_ESCAPE below
+]
+
+# Physical Caps Lock produces the very same CAPSLOCK+F pair as physical F, so
+# the two are indistinguishable from the event stream alone. Holding these
+# modifiers while pressing that key emits CAPSLOCK instead of F.
+#
+# NOTE: on macOS this was plain Ctrl, because Ctrl+F is unused there. On Linux
+# Ctrl+F is Find in essentially every browser and editor, so plain Ctrl would
+# swallow it. Left Ctrl + Left Shift keeps the chord on the three stacked keys
+# at the left edge, reachable with one hand.
+CAPS_ESCAPE = {e.KEY_LEFTCTRL, e.KEY_LEFTSHIFT}
+
+# How to produce a real Caps Lock once the chord fires.
+#
+# Omarchy runs with `compose:caps`, so KEY_CAPSLOCK is the Compose key --
+# emitting it would silently arm Compose rather than toggle Caps Lock. But
+# `shift:both_capslock_cancel` gives each Shift a second level:
+#
+#     key <RTSH> {[ Shift_R, Caps_Lock ], type="ALPHABETIC" };
+#
+# ALPHABETIC picks level 2 whenever Shift is active, so tapping Right Shift
+# while a Shift is held resolves to Caps_Lock. That is exactly what the
+# two-Shift gesture does, synthesised.
+#
+# Set to False to emit a plain KEY_CAPSLOCK instead -- correct only if you drop
+# `compose:caps` from kb_options, which costs you the Compose key.
+CAPS_VIA_BOTH_SHIFT = True
+
+# Modifiers we track from the K860's own stream to evaluate CAPS_ESCAPE.
+TRACKED_MODS = {e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL, e.KEY_LEFTALT, e.KEY_RIGHTALT,
+                e.KEY_LEFTSHIFT, e.KEY_RIGHTSHIFT, e.KEY_LEFTMETA, e.KEY_RIGHTMETA}
+
+COMPANION_OF = {i: c for i, c in PAIRS}
+INTENDED_OF = {c: i for i, c in PAIRS}
+
+CAPS_INTENDED, CAPS_COMPANION = e.KEY_F, e.KEY_CAPSLOCK
+
+
+def log(msg):
+    print(f"k860-fix: {msg}", file=sys.stderr, flush=True)
+
+
+def key_name(code):
+    name = e.bytype[e.EV_KEY].get(code, code)
+    return name[0] if isinstance(name, (list, tuple)) else str(name)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Discovery
+# ─────────────────────────────────────────────────────────────────────────────
+def classify(dev):
+    """Why this device is or is not ours. Returns (claim: bool, reason: str)."""
+    info = dev.info
+    if dev.name.startswith(VIRT_PREFIX) or info.vendor == VIRT_VENDOR:
+        return False, "our own virtual device"
+    if (info.vendor, info.product) in NEVER_TOUCH:
+        return False, "on the never-touch list"
+    if info.vendor != VENDOR:
+        return False, f"vendor {info.vendor:04x} != {VENDOR:04x}"
+    if info.product != PRODUCT:
+        return False, f"product {info.product:04x} != {PRODUCT:04x}"
+    if NAME_MUST_CONTAIN and NAME_MUST_CONTAIN not in dev.name:
+        return False, f"name lacks {NAME_MUST_CONTAIN!r}"
+    if UNIQ is not None and dev.uniq != UNIQ:
+        return False, f"uniq {dev.uniq!r} != {UNIQ!r}"
+    return True, "K860"
+
+
+def find_devices():
+    """Every evdev node belonging to the K860, and nothing else."""
+    found = []
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+        except OSError:
+            continue
+        claim, _ = classify(dev)
+        if claim:
+            found.append(dev)
+        else:
+            dev.close()
+    found.sort(key=lambda d: d.name)
+    return found
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pending-event queue
+# ─────────────────────────────────────────────────────────────────────────────
+class Pending:
+    __slots__ = ("idx", "type", "code", "value", "state", "deadline")
+
+    def __init__(self, idx, type_, code, value, state, deadline=0.0):
+        self.idx = idx
+        self.type = type_
+        self.code = code
+        self.value = value
+        self.state = state          # "ready" | "hold" | "drop"
+        self.deadline = deadline
+
+
+class Filter:
+    def __init__(self, sources, sinks, window=WINDOW, verbose=False):
+        self.sources = sources      # [InputDevice]
+        self.sinks = sinks          # [UInput], index-aligned with sources
+        self.window = window
+        self.verbose = verbose
+        self.queue = deque()
+        self.mods = set()           # modifiers currently held on the K860
+        self.suppressed = set()     # (idx, code) whose release must be dropped
+        self.down = set()           # (idx, code) we emitted as pressed, not yet released
+        self.recent = {}            # intended code -> time it was emitted
+
+    # -- ingest ---------------------------------------------------------------
+    def feed(self, idx, ev, now):
+        if ev.type == e.EV_MSC:
+            return                                  # scancodes are not republished
+        if ev.type != e.EV_KEY:
+            self.queue.append(Pending(idx, ev.type, ev.code, ev.value, "ready"))
+            return
+
+        code, value = ev.code, ev.value
+
+        if code in TRACKED_MODS:
+            if value == 1:
+                self.mods.add(code)
+            elif value == 0:
+                self.mods.discard(code)
+
+        if value == 0:                              # key up
+            if (idx, code) in self.suppressed:
+                self.suppressed.discard((idx, code))
+                if self.verbose:
+                    log(f"  drop  release {key_name(code)}")
+                return
+            self.queue.append(Pending(idx, e.EV_KEY, code, 0, "ready"))
+            return
+
+        if value == 2:                              # autorepeat
+            if (idx, code) in self.suppressed:
+                return
+            self.queue.append(Pending(idx, e.EV_KEY, code, 2, "ready"))
+            return
+
+        # key down
+        if code in COMPANION_OF:                    # an intended key
+            companion = COMPANION_OF[code]
+            held = self._find_held(companion)
+            if held is not None:
+                self._collapse(held, idx, code, now)
+                return
+            self.recent[code] = now
+            self.queue.append(Pending(idx, e.EV_KEY, code, 1, "ready"))
+            return
+
+        if code in INTENDED_OF:                     # a companion key
+            intended = INTENDED_OF[code]
+            fired = self.recent.get(intended)
+            if fired is not None and now - fired <= self.window:
+                # The intended key already went out; this is its bogus twin.
+                self.suppressed.add((idx, code))
+                if self.verbose:
+                    log(f"  drop  {key_name(code)} (twin of {key_name(intended)})")
+                return
+            self.queue.append(
+                Pending(idx, e.EV_KEY, code, 1, "hold", now + self.window))
+            return
+
+        self.queue.append(Pending(idx, e.EV_KEY, code, 1, "ready"))
+
+    def _find_held(self, code):
+        for p in self.queue:
+            if p.state == "hold" and p.type == e.EV_KEY and p.code == code:
+                return p
+        return None
+
+    def _collapse(self, held, idx, code, now):
+        """The intended key arrived while its companion was still pending."""
+        # CAPSLOCK+F is ambiguous: it is emitted by physical F and by physical
+        # Caps Lock alike. The escape modifiers pick Caps Lock.
+        if code == CAPS_INTENDED and held.code == CAPS_COMPANION \
+                and CAPS_ESCAPE and CAPS_ESCAPE <= self.mods:
+            self.suppressed.add((idx, code))        # swallow the F either way
+            if CAPS_VIA_BOTH_SHIFT:
+                held.state = "drop"                 # and the CAPSLOCK
+                self.suppressed.add((held.idx, held.code))
+                self._tap_caps_lock(held.idx)
+            else:
+                held.state = "ready"                # let the CAPSLOCK through
+            if self.verbose:
+                log("  caps  escape chord held -> Caps Lock, drop F")
+            return
+
+        held.state = "drop"
+        self.suppressed.add((held.idx, held.code))
+        self.recent[code] = now
+        self.queue.append(Pending(idx, e.EV_KEY, code, 1, "ready"))
+        if self.verbose:
+            log(f"  keep  {key_name(code)}, drop {key_name(held.code)}")
+
+    def _tap_caps_lock(self, idx):
+        """Synthesise the two-Shift gesture, which XKB resolves to Caps_Lock."""
+        held_shift = self.mods & {e.KEY_LEFTSHIFT, e.KEY_RIGHTSHIFT}
+        # Right Shift needs a Shift already down to reach its second level. The
+        # chord supplies one, but borrow Left Shift if it somehow does not.
+        borrow = not held_shift
+        spare = e.KEY_RIGHTSHIFT if e.KEY_LEFTSHIFT in held_shift or borrow \
+            else e.KEY_LEFTSHIFT
+
+        def tap(code, value):
+            self.queue.append(Pending(idx, e.EV_KEY, code, value, "ready"))
+            self.queue.append(Pending(idx, e.EV_SYN, e.SYN_REPORT, 0, "ready"))
+
+        if borrow:
+            tap(e.KEY_LEFTSHIFT, 1)
+        tap(spare, 1)
+        tap(spare, 0)
+        if borrow:
+            tap(e.KEY_LEFTSHIFT, 0)
+
+
+    # -- egress ---------------------------------------------------------------
+    def flush(self, now):
+        """Emit from the head while it is decided; a held head blocks the rest."""
+        dirty = set()
+        while self.queue:
+            p = self.queue[0]
+            if p.state == "hold":
+                if now < p.deadline:
+                    break
+                p.state = "ready"                   # window expired: genuine press
+                if self.verbose:
+                    log(f"  pass  {key_name(p.code)} (solo)")
+            self.queue.popleft()
+            if p.state == "drop":
+                continue
+            try:
+                if p.type == e.EV_KEY:
+                    if p.value == 1:
+                        self.down.add((p.idx, p.code))
+                    elif p.value == 0:
+                        self.down.discard((p.idx, p.code))
+                self.sinks[p.idx].write(p.type, p.code, p.value)
+                if p.type == e.EV_SYN:
+                    dirty.discard(p.idx)
+                else:
+                    dirty.add(p.idx)
+            except OSError as exc:
+                log(f"write failed on sink {p.idx}: {exc}")
+        for idx in dirty:
+            try:
+                self.sinks[idx].syn()
+            except OSError:
+                pass
+
+    def timeout(self, now):
+        for p in self.queue:
+            if p.state == "hold":
+                return max(0.0, p.deadline - now)
+        return None
+
+    def release_all(self):
+        """Release every key we emitted as pressed.
+
+        Without this, dying mid-keystroke leaves the compositor holding a key
+        that never comes up, and Wayland's client-side repeat turns that into
+        an endless run of that character.
+        """
+        for idx, code in sorted(self.down):
+            try:
+                self.sinks[idx].write(e.EV_KEY, code, 0)
+                self.sinks[idx].syn()
+            except OSError:
+                pass
+        self.down.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# uinput plumbing
+# ─────────────────────────────────────────────────────────────────────────────
+def make_sink(src):
+    caps = src.capabilities(absinfo=True)
+    for drop in (e.EV_SYN, e.EV_FF, e.EV_REP, e.EV_MSC):
+        caps.pop(drop, None)
+    return evdev.UInput(
+        events=caps,
+        name=f"{VIRT_PREFIX} {src.name}",
+        vendor=VIRT_VENDOR,
+        product=VIRT_PRODUCT,
+        version=1,
+        phys=f"{VIRT_PREFIX}/{os.path.basename(src.path)}",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Modes
+# ─────────────────────────────────────────────────────────────────────────────
+def cmd_devices(args):
+    """Print every input device on the system and whether it will be touched."""
+    rows = []
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+        except OSError:
+            continue
+        claim, reason = classify(dev)
+        rows.append((os.path.basename(path), dev.info.vendor, dev.info.product,
+                     dev.name, claim, reason))
+        dev.close()
+    rows.sort(key=lambda r: int(r[0].replace("event", "") or 0))
+
+    width = max((len(r[3]) for r in rows), default = 20)
+    print(f"{'node':<9} {'vid:pid':<10} {'name':<{width}}  verdict")
+    print("-" * (9 + 11 + width + 12))
+    for node, vid, pid, name, claim, reason in rows:
+        mark = "GRAB" if claim else "leave alone"
+        print(f"{node:<9} {vid:04x}:{pid:04x}  {name:<{width}}  {mark}  ({reason})")
+    n = sum(1 for r in rows if r[4])
+    print()
+    print(f"{n} device(s) will be grabbed; {len(rows) - n} left untouched.")
+    return 0 if n else 1
+
+
+def cmd_diag(args):
+    devs = find_devices()
+    if not devs:
+        log(f"no device matching {VENDOR:04x}:{PRODUCT:04x} found")
+        return 1
+    for d in devs:
+        log(f"{d.path}  {d.name!r}  bus=0x{d.info.bustype:04x} "
+            f"{d.info.vendor:04x}:{d.info.product:04x} uniq={d.uniq!r}")
+    log("")
+    log("Press each faulty key once. Ctrl-C to stop. Not grabbing -- keys still work.")
+    log(f"{'time':>9}  {'delta':>7}  {'node':<8} {'type':<8} {'code':<20} value")
+
+    fds = {d.fd: d for d in devs}
+    last = None
+    try:
+        while True:
+            r, _, _ = select.select(fds, [], [])
+            now = time.monotonic()
+            for fd in r:
+                dev = fds[fd]
+                try:
+                    events = list(dev.read())
+                except OSError:
+                    return 0
+                for ev in events:
+                    if ev.type == e.EV_SYN:
+                        continue
+                    delta = "" if last is None else f"{(now - last) * 1000:6.1f}ms"
+                    last = now
+                    tname = e.EV[ev.type]
+                    cname = key_name(ev.code) if ev.type == e.EV_KEY else str(ev.code)
+                    node = os.path.basename(dev.path)
+                    print(f"{now:9.3f}  {delta:>7}  {node:<8} {tname:<8} "
+                          f"{cname:<20} {ev.value}", flush=True)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
+def cmd_run(args):
+    stopping = {"now": False}
+
+    def on_signal(signum, frame):
+        stopping["now"] = True
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    sources, sinks, filt = [], [], None
+
+    def teardown():
+        nonlocal sources, sinks, filt
+        if filt is not None:
+            filt.release_all()
+        for d in sources:
+            try:
+                if args.grab:
+                    d.ungrab()
+            except OSError:
+                pass
+            try:
+                d.close()
+            except OSError:
+                pass
+        for s in sinks:
+            try:
+                s.close()
+            except OSError:
+                pass
+        sources, sinks, filt = [], [], None
+
+    log(f"started (window={args.window * 1000:.0f}ms, grab={args.grab})")
+    try:
+        while not stopping["now"]:
+            if not sources:
+                found = find_devices()
+                if not found:
+                    time.sleep(RESCAN_INTERVAL)
+                    continue
+                # Create every sink BEFORE grabbing anything, so a uinput
+                # failure can never leave the keyboard grabbed and mute.
+                try:
+                    sinks = [make_sink(d) for d in found]
+                except OSError as exc:
+                    log(f"cannot create uinput device: {exc}")
+                    for s in sinks:
+                        s.close()
+                    for d in found:
+                        d.close()
+                    sinks = []
+                    return 1
+                if args.grab:
+                    # Never take the grab mid-keystroke. If a key is down at
+                    # that moment its release is delivered to us instead of the
+                    # compositor, which leaves the key latched there, repeating
+                    # forever, and surviving until the device disconnects.
+                    waited = 0.0
+                    while waited < 5.0:
+                        try:
+                            if not any(d.active_keys() for d in found):
+                                break
+                        except OSError:
+                            break
+                        time.sleep(0.05)
+                        waited += 0.05
+                    if waited:
+                        log(f"waited {waited:.2f}s for keys to be released")
+                    try:
+                        for d in found:
+                            d.grab()
+                    except OSError as exc:
+                        log(f"cannot grab {exc}; backing out")
+                        for d in found:
+                            try:
+                                d.ungrab()
+                            except OSError:
+                                pass
+                            d.close()
+                        for s in sinks:
+                            s.close()
+                        sinks = []
+                        time.sleep(RESCAN_INTERVAL)
+                        continue
+                sources = found
+                filt = Filter(sources, sinks, args.window, args.verbose)
+                for d in sources:
+                    log(f"attached {d.path} {d.name!r}")
+
+            fds = {d.fd: i for i, d in enumerate(sources)}
+            now = time.monotonic()
+            timeout = filt.timeout(now)
+            # Bound the wait: a vanished Bluetooth node may never become
+            # readable, and this also caps how long SIGTERM takes to land.
+            timeout = RESCAN_INTERVAL if timeout is None else min(timeout, RESCAN_INTERVAL)
+            try:
+                r, _, _ = select.select(fds, [], [], timeout)
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                if exc.errno == errno.EBADF:
+                    log("device vanished")
+                    teardown()
+                    continue
+                raise
+
+            now = time.monotonic()
+            lost = False
+            if not r and any(not os.path.exists(d.path) for d in sources):
+                log("device node disappeared; waiting for it to come back")
+                teardown()
+                continue
+            for fd in r:
+                idx = fds[fd]
+                try:
+                    events = list(sources[idx].read())
+                except OSError:
+                    lost = True
+                    break
+                for ev in events:
+                    try:
+                        filt.feed(idx, ev, now)
+                    except Exception as exc:
+                        # Fail open: forward the event untouched rather than
+                        # dying and stranding a held key in the compositor.
+                        log(f"filter error ({exc!r}); passing event through")
+                        filt.queue.append(
+                            Pending(idx, ev.type, ev.code, ev.value, "ready"))
+            if lost:
+                log("device disconnected; waiting for it to come back")
+                teardown()
+                continue
+            filt.flush(time.monotonic())
+    finally:
+        teardown()
+        log("stopped")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="k860-fix", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("devices", help="audit which devices would be grabbed")
+    sub.add_parser("diag", help="watch raw events without grabbing")
+
+    run = sub.add_parser("run", help="grab and filter")
+    run.add_argument("--no-grab", dest="grab", action="store_false",
+                     help="do not take exclusive control (testing only)")
+    run.add_argument("--window", type=float, default=WINDOW,
+                     help=f"pairing window in seconds (default {WINDOW})")
+    run.add_argument("-v", "--verbose", action="store_true",
+                     help="log every collapse decision")
+    run.set_defaults(grab=True)
+
+    args = ap.parse_args()
+    return {"devices": cmd_devices, "diag": cmd_diag, "run": cmd_run}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

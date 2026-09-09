@@ -1,0 +1,29 @@
+[Unit]
+# Give up rather than crash-loop; an unfiltered keyboard beats a flapping one.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+Description=Collapse doubled HID events from the faulty Logitech ERGO K860
+Documentation=file:/usr/local/bin/k860-fix
+After=systemd-udevd.service bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+# Harmless if the module is already loaded or built in; '-' keeps a failure
+# here from blocking the service.
+ExecStartPre=-/usr/bin/modprobe uinput
+ExecStart=/usr/local/bin/k860-fix run
+Restart=always
+RestartSec=2
+
+# The daemon polls for the keyboard, so a Bluetooth disconnect is not a
+# failure -- it just waits. Restart=always covers an actual crash.
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
