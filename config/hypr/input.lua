@@ -65,6 +65,10 @@ hl.config({
     kb_layout = "de",
     kb_variant = "mac",
 
+    -- Natural scrolling for mice. This key covers pointers; the touchpad has
+    -- its own setting below, and both need to be set to match macOS.
+    natural_scroll = true,
+
     touchpad = {
       -- Natural (inverse) scrolling, like macOS.
       natural_scroll = true,
