@@ -116,6 +116,33 @@ Omarchy), emitting `KEY_CAPSLOCK` would trigger *that* instead. Set
 `K860_CAPS_VIA_BOTH_SHIFT=1` and the daemon synthesises a Right Shift tap
 instead, which resolves to `Caps_Lock` under `shift:both_capslock`.
 
+## macOS
+
+This daemon is Linux-only — it depends on evdev and uinput. On macOS the same
+repair is done with [Karabiner-Elements](https://karabiner-elements.pqrs.org/),
+and a ready-made rule covering all ten pairs is in
+[`macos/karabiner-k860.json`](macos/karabiner-k860.json):
+
+```bash
+cp macos/karabiner-k860.json ~/.config/karabiner/assets/complex_modifications/
+```
+
+Then enable it in Karabiner-Elements under *Complex Modifications → Add rule*.
+
+It uses the same approach — `simultaneous` with a 30 ms threshold, scoped to
+`vendor_id 1133 / product_id 45913`, which is `0x046D:0xB359` in the hex the
+Linux side uses. Those ids survive Bluetooth unchanged on both platforms.
+
+Two differences worth knowing if you run both:
+
+- **The Caps Lock escape is `left_control` there, not `Ctrl+Shift`.** On macOS
+  Find is `Cmd+F`, so `Ctrl+F` is free. On Linux `Ctrl+F` is Find nearly
+  everywhere, so the Linux default moves the chord out of the way.
+- **Karabiner needs `key_down_order: strict`**, which documents the arrival
+  order per pair: `caps_lock` before `f`, but the intended key first in all nine
+  others. This daemon handles either order, but the asymmetry is real — it shows
+  up identically in Linux event captures.
+
 ## How it works
 
 **The key you meant is never delayed.** Only the bogus companion is held, and
@@ -141,6 +168,7 @@ k860-fix.service    systemd unit
 uinput.conf         /etc/modules-load.d entry
 install.sh          uninstall.sh
 test-filter.py      run this before installing an edit
+macos/              equivalent Karabiner-Elements rule
 personal/           the author's machine, as a worked example
 ```
 
