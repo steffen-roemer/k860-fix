@@ -94,12 +94,16 @@ def _env_keys(name, default):
 # Device identity
 # ─────────────────────────────────────────────────────────────────────────────
 # 1133/45913 from Karabiner == 0x046D/0xB359, and they survive Bluetooth intact.
+# Through a Unifying receiver the same keyboard is exposed by hid-logitech-hidpp
+# as 0x046D/0x4088, on a single node carrying both keyboard and mouse events.
+# The fault is in the keyboard, so it doubles keys over either transport.
 VENDOR = 0x046D
-PRODUCT = 0xB359
+PRODUCTS = {0xB359: "Bluetooth", 0x4088: "Unifying"}
 
 # Pin to one specific keyboard by its Bluetooth MAC, e.g.
 #   K860_UNIQ=aa:bb:cc:dd:ee:ff
-# Unset matches any K860, which is what you want unless you own two.
+# Unset matches any K860, which is what you want unless you own two. Note the
+# Unifying node carries no MAC, so pinning excludes the receiver path.
 UNIQ = _env_str("K860_UNIQ", None)
 
 # A device must clear ALL of these before it is even considered. Three
@@ -218,13 +222,13 @@ def classify(dev):
         return False, "on the never-touch list"
     if info.vendor != VENDOR:
         return False, f"vendor {info.vendor:04x} != {VENDOR:04x}"
-    if info.product != PRODUCT:
-        return False, f"product {info.product:04x} != {PRODUCT:04x}"
+    if info.product not in PRODUCTS:
+        return False, f"product {info.product:04x} not in {', '.join(f'{p:04x}' for p in PRODUCTS)}"
     if NAME_MUST_CONTAIN and NAME_MUST_CONTAIN not in dev.name:
         return False, f"name lacks {NAME_MUST_CONTAIN!r}"
     if UNIQ is not None and dev.uniq != UNIQ:
         return False, f"uniq {dev.uniq!r} != {UNIQ!r}"
-    return True, "K860"
+    return True, f"K860 via {PRODUCTS[info.product]}"
 
 
 def find_devices():
@@ -484,7 +488,7 @@ def cmd_devices(args):
 def cmd_diag(args):
     devs = find_devices()
     if not devs:
-        log(f"no device matching {VENDOR:04x}:{PRODUCT:04x} found")
+        log(f"no device matching {VENDOR:04x}:{'/'.join(f'{p:04x}' for p in PRODUCTS)} found")
         return 1
     for d in devs:
         log(f"{d.path}  {d.name!r}  bus=0x{d.info.bustype:04x} "
