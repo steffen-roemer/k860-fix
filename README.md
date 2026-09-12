@@ -72,7 +72,8 @@ top of `k860-fix` is the whole configuration:
 PAIRS = [
     (e.KEY_D,      e.KEY_KPSLASH),      # physical D also emits numpad /
     (e.KEY_3,      e.KEY_KP8),
-    (e.KEY_B,      e.BTN_MIDDLE),       # companion is on the Mouse node
+    (e.KEY_B,      e.BTN_MIDDLE),       # over Bluetooth: companion is on the Mouse node
+    (e.KEY_B,      e.KEY_COMPOSE),      # over a Unifying receiver: the Menu key, ~20 ms later
     ...
 ]
 ```
@@ -96,7 +97,7 @@ Optional, in `/etc/default/k860-fix`:
 
 | Variable | Default | |
 |---|---|---|
-| `K860_WINDOW` | `0.030` | Pairing window, seconds. The observed gap is ~0.5 ms, so this has wide margin. |
+| `K860_WINDOW` | `0.050` | Pairing window, seconds. Over Bluetooth the twin trails by ~0.5 ms, over a Unifying receiver by ~20 ms. |
 | `K860_CAPS_ESCAPE` | `LEFTCTRL,LEFTSHIFT` | Modifiers that turn the ambiguous Caps/F key into a real Caps Lock. |
 | `K860_CAPS_VIA_BOTH_SHIFT` | unset | Set to `1` if your XKB options remap the Caps Lock key — see below. |
 | `K860_UNIQ` | unset | Pin to one keyboard by Bluetooth MAC. Only needed if you own two. |

@@ -138,7 +138,7 @@ VIRT_PREFIX = "k860-fix"
 # fastest human digraph (~60 ms), so it cannot collapse two real keystrokes.
 # The only cost is that a *genuinely* pressed companion key (numpad, Page Up,
 # media, Compose) waits this long. Drop to 0.010 if that ever feels sluggish.
-WINDOW = _env_float("K860_WINDOW", 0.030)
+WINDOW = _env_float("K860_WINDOW", 0.050)
 
 # How often to look for the keyboard when it is absent (Bluetooth reconnects).
 RESCAN_INTERVAL = 2.0
@@ -160,7 +160,9 @@ PAIRS = [
     (e.KEY_TAB,    e.KEY_PAGEUP),       # physical Tab
     (e.KEY_T,      e.KEY_PREVIOUSSONG), # physical T
     (e.KEY_DELETE, e.KEY_KPASTERISK),   # physical Entf / Delete Forward
-    (e.KEY_B,      e.BTN_MIDDLE),       # physical B  (companion is on the Mouse node)
+    (e.KEY_B,      e.BTN_MIDDLE),       # physical B over Bluetooth (companion is on the Mouse node)
+    (e.KEY_B,      e.KEY_COMPOSE),      # physical B over the Unifying receiver: the twin is
+                                        # the Menu key and trails B by ~20 ms, not 0.5 ms
     (e.KEY_F,      e.KEY_CAPSLOCK),     # physical F  -- see CAPS_ESCAPE below
 ]
 
@@ -195,7 +197,10 @@ CAPS_VIA_BOTH_SHIFT = _env_bool("K860_CAPS_VIA_BOTH_SHIFT", False)
 TRACKED_MODS = {e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL, e.KEY_LEFTALT, e.KEY_RIGHTALT,
                 e.KEY_LEFTSHIFT, e.KEY_RIGHTSHIFT, e.KEY_LEFTMETA, e.KEY_RIGHTMETA}
 
-COMPANION_OF = {i: c for i, c in PAIRS}
+# An intended key may have several possible twins (B differs by transport).
+COMPANION_OF = {}
+for _i, _c in PAIRS:
+    COMPANION_OF.setdefault(_i, []).append(_c)
 INTENDED_OF = {c: i for i, c in PAIRS}
 
 CAPS_INTENDED, CAPS_COMPANION = e.KEY_F, e.KEY_CAPSLOCK
@@ -308,11 +313,11 @@ class Filter:
 
         # key down
         if code in COMPANION_OF:                    # an intended key
-            companion = COMPANION_OF[code]
-            held = self._find_held(companion)
-            if held is not None:
-                self._collapse(held, idx, code, now)
-                return
+            for companion in COMPANION_OF[code]:
+                held = self._find_held(companion)
+                if held is not None:
+                    self._collapse(held, idx, code, now)
+                    return
             self.recent[code] = now
             self.queue.append(Pending(idx, e.EV_KEY, code, 1, "ready"))
             return

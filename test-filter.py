@@ -13,9 +13,9 @@ class Sink:
         if t == e.EV_KEY: s.out.append((c, v))
     def syn(s): pass
 
-def run(seq, mods_before=()):
+def run(seq, mods_before=(), window=0.030):
     sinks = [Sink(), Sink()]
-    f = m.Filter([None, None], sinks, window=0.030)
+    f = m.Filter([None, None], sinks, window=window)
     t = 0.0
     for code in mods_before:
         f.feed(0, m.evdev.InputEvent(0, 0, e.EV_KEY, code, 1), t); t += 0.001
@@ -56,6 +56,16 @@ s, f = run([(1, e.BTN_MIDDLE, 1, 0), (0, e.KEY_B, 1, .0005),
             (1, e.BTN_MIDDLE, 0, .110), (0, e.KEY_B, 0, .0007)])
 check("physical B -> b only (cross-node)", names(s[0].out), [("KEY_B", 1), ("KEY_B", 0)])
 check("  middle click suppressed", names(s[1].out), [])
+
+# Over the Unifying receiver the twin of B is the Menu key, ~20 ms behind.
+s, f = run([(0, e.KEY_B, 1, 0), (0, e.KEY_COMPOSE, 1, .020),
+            (0, e.KEY_B, 0, .100), (0, e.KEY_COMPOSE, 0, .020)], window=0.050)
+check("physical B via receiver -> b only", names(s[0].out), [("KEY_B", 1), ("KEY_B", 0)])
+check("  no stuck keys", f.down, set())
+
+# A genuine Menu key on its own still gets through, just delayed by the window.
+s, f = run([(0, e.KEY_COMPOSE, 1, 0), (0, e.KEY_COMPOSE, 0, .080)], window=0.050)
+check("lone Menu key passes", names(s[0].out), [("KEY_COMPOSE", 1), ("KEY_COMPOSE", 0)])
 
 CHORD = [(0, e.KEY_CAPSLOCK, 1, 0), (0, e.KEY_F, 1, .0005),
          (0, e.KEY_CAPSLOCK, 0, .112), (0, e.KEY_F, 0, .0007)]

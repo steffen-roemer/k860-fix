@@ -11,10 +11,10 @@ K860_CAPS_VIA_BOTH_SHIFT=1
 # edge, reachable with one hand. Note this makes Ctrl+Shift+F unavailable.
 K860_CAPS_ESCAPE=LEFTCTRL,LEFTSHIFT
 
-# Pairing window. Measured gap between a key and its bogus twin is ~0.5 ms, so
-# the 30 ms default has plenty of margin; lower it if a genuinely pressed
-# numpad key feels sluggish.
-#K860_WINDOW=0.030
+# Pairing window. The twin trails the key by ~0.5 ms over Bluetooth but ~20 ms
+# over the Unifying receiver, hence the 50 ms default; lower it if a genuinely
+# pressed numpad or Menu key feels sluggish.
+#K860_WINDOW=0.050
 
 # Pin to one specific keyboard by Bluetooth MAC. Unset matches any K860, which
 # is what you want unless you own two.
