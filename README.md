@@ -130,9 +130,22 @@ cp macos/karabiner-k860.json ~/.config/karabiner/assets/complex_modifications/
 
 Then enable it in Karabiner-Elements under *Complex Modifications → Add rule*.
 
-It uses the same approach — `simultaneous` with a 30 ms threshold, scoped to
-`vendor_id 1133 / product_id 45913`, which is `0x046D:0xB359` in the hex the
-Linux side uses. Those ids survive Bluetooth unchanged on both platforms.
+It uses the same approach — `simultaneous` with a threshold equal to the
+daemon's pairing window — scoped to the keyboard's Bluetooth id
+(`vendor_id 1133 / product_id 45913`, `0x046D:0xB359` on the Linux side) and to
+the Unifying receiver's id (`product_id 50475`, `0xC52B`) for when the keyboard
+comes in through the dongle.
+
+**The JSON is generated, not hand-edited.** `macos/generate-karabiner.py` reads
+`PAIRS`, the window and the Caps Lock chord straight out of `k860-fix`, so the
+two platforms share one pair table. After changing `PAIRS`, run
+
+```bash
+python3 macos/generate-karabiner.py
+```
+
+`test-filter.py` runs the generator in `--check` mode and fails while the JSON
+is stale, and the install script refuses to install on a failing suite.
 
 Two differences worth knowing if you run both:
 
@@ -169,7 +182,7 @@ k860-fix.service    systemd unit
 uinput.conf         /etc/modules-load.d entry
 install.sh          uninstall.sh
 test-filter.py      run this before installing an edit
-macos/              equivalent Karabiner-Elements rule
+macos/              equivalent Karabiner-Elements rule, generated from PAIRS
 personal/           the author's machine, as a worked example
 ```
 

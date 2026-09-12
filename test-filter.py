@@ -97,5 +97,11 @@ for label, mod in [("Super+F", e.KEY_LEFTMETA), ("Ctrl+F (Find)", e.KEY_LEFTCTRL
     check(f"{label} unaffected", names(s[0].out),
           [(m.key_name(mod), 1), ("KEY_F", 1), ("KEY_F", 0)])
 
+# The macOS rule is generated from the same pair table; a stale JSON is a failure.
+import subprocess
+stale = subprocess.run([sys.executable, "macos/generate-karabiner.py", "--check"],
+                       capture_output=True, text=True)
+check("macos/karabiner-k860.json in sync with PAIRS", stale.returncode, 0)
+
 print("\nALL PASS" if ok else "\nFAILURES ABOVE")
 sys.exit(0 if ok else 1)
