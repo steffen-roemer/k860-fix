@@ -36,7 +36,7 @@ Press a suspect key. Two `EV_KEY … 1` lines for one keypress means yes.
 ## Install
 
 ```bash
-git clone https://github.com/steffen-roemer/k860-fix
+git clone https://github.com/orkitec/k860-fix
 cd k860-fix
 sudo ./install.sh
 ```
@@ -175,3 +175,7 @@ personal/           the author's machine, as a worked example
 ## Licence
 
 MIT.
+
+---
+
+Made by [Orkitec](https://github.com/orkitec).
